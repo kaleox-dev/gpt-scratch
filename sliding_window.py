@@ -70,7 +70,8 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        banded = torch.tril(torch.triu(torch.ones(block_size, block_size), diagonal=-(window_size - 1)))
+        self.register_buffer('tril', banded)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -84,9 +85,6 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
 
-        # implement sliding window attention
-        torch.tril(torch.triu(torch.ones(256, 256), diagonal=-(window_size - 1)))
-
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -96,7 +94,6 @@ class Head(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
-
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
