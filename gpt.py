@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+from torch.nn import LayerNorm, functional as F
 
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
@@ -118,17 +118,6 @@ class FeedFoward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * x * rms
-
-
 class Block(nn.Module):
     """ Transformer block: communication followed by computation """
 
@@ -138,8 +127,8 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffwd = FeedFoward(n_embd)
-        self.ln1 = RMSNorm(n_embd)
-        self.ln2 = RMSNorm(n_embd)
+        self.ln1 = LayerNorm(n_embd)
+        self.ln2 = LayerNorm(n_embd)
 
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
@@ -154,7 +143,7 @@ class GPTLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = RMSNorm(n_embd) # final layer norm
+        self.ln_f = LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
