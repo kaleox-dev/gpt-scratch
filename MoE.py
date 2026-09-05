@@ -66,7 +66,6 @@ class Head(nn.Module):
 
     def __init__(self, head_size):
         super().__init__()
-        # projecting embedding from 384 --> 64
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
@@ -74,61 +73,21 @@ class Head(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        self.cache_len = 0
-        self.register_buffer('cache_k', torch.zeros(0), persistent=False)
-        self.register_buffer('cache_v', torch.zeros(0), persistent=False)
-
-    def reset_cache(self):
-        self.cache_len = 0
-
-    def forward(self, x, cache=False):
+    def forward(self, x):
         # input of size (batch, time-step, channels)
         # output of size (batch, time-step, head size)
         B,T,C = x.shape
         k = self.key(x)   # (B,T,hs)
         q = self.query(x) # (B,T,hs)
+        # compute attention scores ("affinities")
+        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
+        # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,hs)
-
-        if not cache:
-            # compute attention scores ("affinities")
-            wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-            wei = F.softmax(wei, dim=-1) # (B, T, T)
-            wei = self.dropout(wei)
-            # perform the weighted aggregation of the values
-            out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-            return out
-
-        # if we are using kv-cache
-        hs = k.shape[-1] # last dim, head size
-        if self.cache_k.shape != (B, block_size, hs): 
-            # read off the tensor if it hasn't been defined yet
-            self.cache_k = torch.zeros(B, block_size, hs, device=x.device, dtype=x.dtype)
-            self.cache_v = torch.zeros(B, block_size, hs, device=x.device, dtype=x.dtype)
-
-        # where you are token wise in the cache
-        pos = self.cache_len
-
-        # slices a block of either prefill size or decode size 1 [:, pos:pos+T, :] 
-        # write the new k and v into the cache (prefill)
-        self.cache_k[:, pos:pos+T] = k
-        self.cache_v[:, pos:pos+T] = v
-        self.cache_len += T
-
-        # take the entire cached k and v out [:, :self.cache_len, :]
-        # read the entire cache for computing attention
-        K = self.cache_k[:, :self.cache_len] # (B, t, hs)
-        V = self.cache_v[:, :self.cache_len] 
-
-        # compute attention scores
-        wei = q @ K.transpose(-2, -1) * hs**-0.5
-        # mask out (for prefill)
-        wei = wei.masked_fill(self.tril[pos:pos+T, :self.cache_len] == 0, float('-inf'))
-        # softmax
-        wei = F.softmax(wei, dim=-1)
-        # compute the attention scores using the cached V 
-        return wei @ V
-
+        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        return out
 
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
@@ -139,8 +98,8 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, cache=False):
-        out = torch.cat([h(x, cache) for h in self.heads], dim=-1)
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
 
@@ -171,8 +130,8 @@ class Block(nn.Module):
         self.ln1 = LayerNorm(n_embd)
         self.ln2 = LayerNorm(n_embd)
 
-    def forward(self, x, cache=False):
-        x = x + self.sa(self.ln1(x), cache)
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -183,7 +142,7 @@ class GPTLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -198,26 +157,17 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, cache=False, pos_offset=0):
+    def forward(self, idx, targets=None):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(
-            torch.arange(pos_offset, pos_offset + T, device=device)) # (T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-
-        for block in self.blocks:
-            x = block(x, cache)
-
+        x = self.blocks(x) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
-
-        # project onto the vocabulary
-        # lm_head.weight = (65, 384) stores the embedding of each character
-        # x @ W^T = (B,T,C) @ (C,vocab_size) = (B,T,vocab_size)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
-        # compute loss if training
         if targets is None:
             loss = None
         else:
@@ -228,31 +178,21 @@ class GPTLanguageModel(nn.Module):
 
         return logits, loss
 
-    @torch.no_grad()
     def generate(self, idx, max_new_tokens):
-        self.eval()
-
-        for block in self.blocks:
-            for head in block.sa.heads:
-                head.reset_cache()
-
-        max_new = min(max_new_tokens, block_size - idx.shape[1])
-        for i in range(max_new):
-            if i == 0:
-                #  prefill the whole prompt
-                x, offset = idx, 0 
-            else:
-                # decode the newest token only
-                # only newest sampled token [T] (B, 1), T-1
-                x, offset = idx[:, -1:], idx.shape[1] - 1 
-
-            # call forward with x (one token for decode)
-            logits, _ = self(x, cache=True, pos_offset=offset)
-            # get the probabilities for each character in the last row (last token)
-            probs = F.softmax(logits[:, -1, :], dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # concatenate the new sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1)
+        # idx is (B, T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+            # get the predictions
+            logits, loss = self(idx_cond)
+            # focus only on the last time step
+            logits = logits[:, -1, :] # becomes (B, C)
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
 model = GPTLanguageModel()
